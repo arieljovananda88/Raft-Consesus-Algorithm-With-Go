@@ -178,7 +178,6 @@ func (hs httpServer) getHandler(w http.ResponseWriter, r *http.Request) {
 	var c types.Command
 	c.Kind = types.GetCommand
 	c.Key = r.URL.Query().Get("key")
-	// fmt.Println(c.Key)
 	var value []byte
 	var err error
 	var results []types.AddLogResult

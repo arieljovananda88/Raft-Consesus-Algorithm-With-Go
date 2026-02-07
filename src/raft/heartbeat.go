@@ -12,65 +12,44 @@ func (s *Server) AppendEntries() {
 	s.MarkInactiveInCluster()
 	for i := range s.Cluster {
 		if i == s.IndexInCluster {
-			// s.debugf("Leader: len logs = %d, id = %d, next log = %d, match = %d.", len(s.log), s.cluster[i].Id, s.cluster[i].nextLogIndex, s.cluster[i].matchIndex)
 			continue
 		}
-		// fmt.Println(s.Cluster[i].Active)
+
 		if !s.Cluster[i].Active {
-			// fmt.Println("masuk")
 			continue
 		}
 
 		go func(index int) {
 			s.Mu.Lock()
-			// fmt.Println("append entry")
-			// s.debug("[Leader] Sending Heartbeat")
-			var entriesToAppend []types.Entry
+
+			next := s.Cluster[index].NextLogIndex
+
+			// prevLogIndex is next-1, or 0 if next == 0
 			var prevLogIndex uint64
 			var prevLogTerm uint64
-			// var clusterConnected bool
-			next := s.Cluster[index].NextLogIndex
-			// // fmt.Println(next)
-			// fmt.Println("next")
-			// fmt.Println(next)
+
 			if next > 0 {
 				prevLogIndex = next - 1
 			} else {
 				prevLogIndex = 0
 			}
 
-			// fmt.Println("len log")
-			// fmt.Println(len(s.log))
-
-			if len(s.Log) == 0 {
-				prevLogTerm = 0
-			} else if len(s.Log) == 1 {
-				prevLogTerm = s.Log[0].Term
-				if next != 0 {
-					if uint64(len(s.Log)) >= next {
-						entriesToAppend = s.Log[(next - 1):]
-					}
-
-					if len(entriesToAppend) > MAX_ENTRIES_PER_APPEND {
-						entriesToAppend = entriesToAppend[:MAX_ENTRIES_PER_APPEND]
-					}
-				}
+			// prevLogTerm comes from the log if prevLogIndex > 0
+			if prevLogIndex > 0 && prevLogIndex-1 < uint64(len(s.Log)) {
+				prevLogTerm = s.Log[prevLogIndex-1].Term
 			} else {
-				if next != 0 {
-					if next != 1 {
-						prevLogTerm = s.Log[prevLogIndex-1].Term
-					} else {
-						prevLogTerm = s.Log[0].Term
-					}
+				prevLogTerm = 0
+			}
 
-					if uint64(len(s.Log)-1) >= next-1 {
-						entriesToAppend = s.Log[(next - 1):]
-					}
+			// Entries are everything from next onward
+			var entriesToAppend []types.Entry
+			if next > 0 && next-1 < uint64(len(s.Log)) {
+				entriesToAppend = s.Log[next-1:]
+			}
 
-					if len(entriesToAppend) > MAX_ENTRIES_PER_APPEND {
-						entriesToAppend = entriesToAppend[:MAX_ENTRIES_PER_APPEND]
-					}
-				}
+			// Limit batch size
+			if len(entriesToAppend) > MAX_ENTRIES_PER_APPEND {
+				entriesToAppend = entriesToAppend[:MAX_ENTRIES_PER_APPEND]
 			}
 
 			req := types.AppendEntriesRequest{
@@ -92,12 +71,9 @@ func (s *Server) AppendEntries() {
 			defer s.Mu.Unlock()
 			if res.Success {
 				s.Cluster[index].NextLogIndex = max(req.PrevLogIndex+uint64(len(entriesToAppend))+1, 1)
-				// prev := s.cluster[index].nextLogIndex - 1
 				s.Cluster[index].MatchIndex = s.Cluster[index].NextLogIndex - 1
-				// s.debugf("Messages (%d) accepted for %d. Prev Index: %d, Next Index: %d, Match Index: %d.", len(req.Entries), s.cluster[index].Id, prev, s.cluster[index].nextLogIndex, s.cluster[index].matchIndex)
 			} else {
 				s.Cluster[index].NextLogIndex = max(s.Cluster[index].NextLogIndex-1, 1)
-				// s.debugf("Forced to go back to %d for: %d.", s.cluster[index].nextLogIndex, s.cluster[index].Id)
 			}
 
 		}(i)
@@ -129,11 +105,10 @@ func (s *Server) HandleAppendEntriesRequest(req types.AppendEntriesRequest, rsp 
 
 	s.debug("[Follower] Heartbeat Received")
 	interval := time.Duration(rand.Intn(s.HeartbeatInterval*2) + s.HeartbeatInterval*2)
-	// s.debugf("New interval: %s.", interval*time.Millisecond)
 	s.ElectionTimeout = time.Now().Add(interval * time.Millisecond)
 
 	logLen := uint64(len(s.Log))
-	validPreviousLog := req.PrevLogIndex == 0 /* This is the induction step */ ||
+	validPreviousLog := req.PrevLogIndex == 0 ||
 		(req.PrevLogIndex-1 < logLen &&
 			s.Log[req.PrevLogIndex-1].Term == req.PrevLogTerm)
 	if !validPreviousLog {
@@ -155,9 +130,7 @@ func (s *Server) HandleAppendEntriesRequest(req types.AppendEntriesRequest, rsp 
 		}
 
 		if i < uint64(len(s.Log)) && s.Log[i].Term != e.Term {
-			// prevCap := cap(s.Log)
 			s.Log = s.Log[:i]
-			// Server_assert(s, "Capacity remains the same while we truncated.", cap(s.Log), prevCap)
 		}
 
 		if i < uint64(len(s.Log)) {
@@ -171,7 +144,6 @@ func (s *Server) HandleAppendEntriesRequest(req types.AppendEntriesRequest, rsp 
 
 	if req.LeaderCommit > s.CommitIndex {
 		s.CommitIndex = min(req.LeaderCommit, uint64(len(s.Log)-1))
-		// fmt.Println(s.commitIndex)
 	}
 
 	rsp.Success = true
@@ -218,16 +190,19 @@ func (s *Server) updateCommitIndexAsLeader() {
 }
 
 func (s *Server) hasQuorumForIndex(index uint64) bool {
-	quorum := len(s.Cluster)/2 + 1
-	for j := range s.Cluster {
-		if quorum == 0 {
-			return true
-		}
-		if j == s.IndexInCluster || s.Cluster[j].MatchIndex >= index {
-			quorum--
+	active := 0
+	matched := 0
+
+	for i := range s.Cluster {
+		if s.Cluster[i].Active {
+			active++
+			if i == s.IndexInCluster || s.Cluster[i].MatchIndex >= index {
+				matched++
+			}
 		}
 	}
-	return quorum == 0
+
+	return matched >= active/2+1
 }
 
 func (s *Server) commitLogEntry() {
